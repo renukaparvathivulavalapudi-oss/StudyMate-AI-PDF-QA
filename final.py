@@ -5,74 +5,93 @@ import os
 import tempfile
 from sentence_transformers import SentenceTransformer
 from transformers import pipeline
-from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
-# --- Page Config ---
-st.set_page_config(page_title="StudyMate: AI PDF Q&A", layout="wide")
+# ---------------- PAGE CONFIG ----------------
+st.set_page_config(page_title="StudyMate AI – PDF Q&A", layout="wide")
+st.title("📘 StudyMate – AI Powered PDF Q&A")
+st.write("Upload a PDF and ask any question related to it. StudyMate finds the answer intelligently 😊")
 
-# --- Title ---
-st.title("📘 StudyMate: AI PDF-Based Q&A System")
-
-# --- Upload PDF ---
-uploaded_file = st.file_uploader("📤 Upload your academic PDF", type="pdf")
-
-# --- Load Embedding Model & QA Pipeline ---
+# ---------------- LOAD MODELS ----------------
 @st.cache_resource
 def load_models():
     embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-    qa_pipeline = pipeline("question-answering", model="deepset/roberta-base-squad2")
-    return embed_model, qa_pipeline
+    qa_model = pipeline("question-answering", model="deepset/roberta-base-squad2")
+    return embed_model, qa_model
 
-embed_model, qa_pipeline = load_models()
+embed_model, qa_model = load_models()
 
-# --- Functions ---
-def extract_text_from_pdf(pdf_path):
+
+# ---------------- FUNCTIONS ----------------
+def extract_text_chunks(pdf_path, chunk_size=700):
     doc = fitz.open(pdf_path)
-    text_chunks = []
+    chunks = []
+
     for page in doc:
         text = page.get_text()
-        if text.strip():
-            text_chunks.append(text)
-    return text_chunks
+        text = text.replace("\n", " ").strip()
 
-def create_faiss_index(chunks, embeddings):
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatL2(dim)
-    index.add(embeddings)
-    return index
+        if len(text) == 0:
+            continue
+        
+        # Smart Chunking
+        words = text.split()
+        for i in range(0, len(words), chunk_size):
+            chunk = " ".join(words[i:i+chunk_size])
+            chunks.append(chunk)
 
-def get_top_k_chunks(question, chunks, embeddings, index, k=3):
-    question_embedding = embed_model.encode([question])
-    D, I = index.search(question_embedding, k)
-    top_chunks = [chunks[i] for i in I[0]]
-    return top_chunks
+    return chunks
 
-# --- Main Logic ---
-if uploaded_file is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(uploaded_file.read())
-        tmp_path = tmp_file.name
 
-    # Extract text
-    chunks = extract_text_from_pdf(tmp_path)
-    
-    # Embed chunks
-    embeddings = embed_model.encode(chunks, show_progress_bar=True)
-    
-    # Build index
-    index = create_faiss_index(chunks, embeddings)
-    
-    # Ask Question
-    st.success("✅ PDF processed successfully!")
+def create_faiss_index(chunks):
+    embeddings = embed_model.encode(chunks)
+    embedding_dim = embeddings.shape[1]
+
+    index = faiss.IndexFlatL2(embedding_dim)
+    index.add(np.array(embeddings, dtype="float32"))
+
+    return index, embeddings
+
+
+def search_chunks(question, chunks, index, k=3):
+    q_embed = embed_model.encode([question]).astype("float32")
+    distances, indices = index.search(q_embed, k)
+
+    selected_chunks = [chunks[i] for i in indices[0]]
+    similarity_scores = distances[0]
+
+    return selected_chunks, similarity_scores
+
+
+# ---------------- MAIN APP ----------------
+uploaded_pdf = st.file_uploader("📤 Upload your PDF", type="pdf")
+
+if uploaded_pdf is not None:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(uploaded_pdf.read())
+        pdf_path = tmp.name
+
+    with st.spinner("⏳ Reading PDF and preparing AI brain..."):
+        chunks = extract_text_chunks(pdf_path)
+        index, embeddings = create_faiss_index(chunks)
+
+    st.success("✅ PDF processed successfully! Ask your question now.")
     question = st.text_input("❓ Ask a question based on the uploaded PDF")
 
     if question:
-        top_chunks = get_top_k_chunks(question, chunks, embeddings, index)
-        context = " ".join(top_chunks)
-        result = qa_pipeline(question=question, context=context)
-        
+        with st.spinner("🤖 Thinking..."):
+            top_chunks, scores = search_chunks(question, chunks, index)
+
+            # Hallucination Protection
+            if scores[0] > 2.0:
+                st.warning("⚠ The answer may not exist clearly in the PDF. Showing best attempt.")
+            
+            context = " ".join(top_chunks)
+
+            result = qa_model(question=question, context=context)
+
         st.subheader("📌 Answer:")
-        st.write(result['answer'])
+        st.write(result["answer"])
 
         with st.expander("📄 Source Context"):
             st.write(context)
